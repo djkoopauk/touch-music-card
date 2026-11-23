@@ -53,9 +53,38 @@ const SPEELT = ['playing', 'paused', 'buffering'];
 // imageproxy on http://192.168.x.x:8095 - has no https twin, so it is dropped
 // and the tile falls back to its icon.
 const LOKAAL = /^(localhost|\d{1,3}(\.\d{1,3}){3}|\[[0-9a-f:]+\]|[^.]+|.+\.(local|lan|home|internal))$/i;
+// Image options from the card config (set in setConfig / set hass):
+//   image_base  your Home Assistant's https address. Music Assistant covers
+//               (http://<ip>:8095/imageproxy/...) are fetched from
+//               <image_base>/imageproxy/... instead, so they load on an https
+//               dashboard. Needs a reverse-proxy rule passing /imageproxy/ to
+//               Music Assistant's webserver.
+//   image_size  ask Music Assistant for covers at this size (80, 160, 256, 512
+//               or 1024) instead of the original - lighter on a Nest Hub.
+const OPTS = { base: '', size: 0, hass: '', max: 0 };
+const MAAT = (s) => {
+  if (!OPTS.size) return s;
+  return /[?&]size=\d+/.test(s)
+    ? s.replace(/([?&])size=\d+/, `$1size=${OPTS.size}`)
+    : `${s}${s.includes('?') ? '&' : '?'}size=${OPTS.size}`;
+};
 const VEILIG = (u) => {
-  const s = String(u || '');
+  let s = String(u || '');
   if (!s) return '';
+  // A path on Home Assistant itself (/api/media_player_proxy/...). On a cast
+  // dashboard the page is served from cast.home-assistant.io, so a bare path
+  // would be fetched from there (and return its Nest Hub picture). Anchor it to
+  // Home Assistant's own address.
+  if (s.startsWith('/') && !s.startsWith('//')) {
+    const b = (OPTS.base || OPTS.hass || '').replace(/\/$/, '');
+    return b + s;
+  }
+  // A Music Assistant cover: optionally via image_base, optionally resized.
+  const ip = s.search(/\/imageproxy\//i);
+  if (ip > 0) {
+    if (OPTS.base) s = OPTS.base.replace(/\/$/, '') + s.slice(ip);
+    s = MAAT(s);
+  }
   const https = typeof location !== 'undefined' && location.protocol === 'https:';
   if (!https || s.slice(0, 5).toLowerCase() !== 'http:') return s;
   const m = s.match(/^http:\/\/([^/:?#]+)(:\d+)?/i);
@@ -72,6 +101,8 @@ const SOORT_VAN = (uri) => ((uri || '').split('://')[1] || '').split('/')[0] || 
 // the card hangs on the wire, too long and a new playlist stays invisible.
 const BIB_TTL = 10 * 60 * 1000;
 const BIB_MAX = 500;
+// max_items in the config may raise the cap, e.g. to show every album artist.
+const BIB_CAP = () => Math.max(BIB_MAX, OPTS.max || 0);
 
 const SOORTEN = [
   { key: 'track', lijst: true, veld: 'tracks' },
@@ -886,6 +917,9 @@ class MusicAssistantTouchCard extends HTMLElement {
     }
     this._cfg = config;
     this._cats = config.categories || [];
+    OPTS.base = config.image_base || '';
+    OPTS.size = Number(config.image_size) || 0;
+    OPTS.max = Number(config.max_items) || 0;
     // keyboard: true  -> eigen schermtoetsenbord (Nest Hub, kiosk)
     // keyboard: false -> gewoon tekstveld met het toetsenbord van het apparaat
     this._schermtoetsen = config.keyboard !== false;
@@ -925,7 +959,7 @@ class MusicAssistantTouchCard extends HTMLElement {
 
   _bronSleutel(b) {
     return [b.media_type || 'playlist', b.order_by || '', b.favorite ? 1 : 0,
-      b.search || '', b.limit || 24].join('|');
+      b.search || '', b.limit || 24, b.album_artists_only ? 'aa' : ''].join('|');
   }
 
   // Every library answer also feeds the cover index, so a hand-made tile that
@@ -945,11 +979,14 @@ class MusicAssistantTouchCard extends HTMLElement {
     const data = {
       config_entry_id: this._cfg.config_entry_id,
       media_type: b.media_type || 'playlist',
-      limit: Math.min(b.limit || 24, BIB_MAX),
+      limit: Math.min(b.limit || 24, BIB_CAP()),
     };
     if (b.order_by) data.order_by = b.order_by;
     if (b.favorite) data.favorite = true;
     if (b.search) data.search = b.search;
+    // album_artists_only: true on an artist category leaves out everyone who
+    // only appears as a guest or on a compilation.
+    if (b.album_artists_only) data.album_artists_only = true;
     const p = this._ws({
       type: 'call_service',
       domain: 'music_assistant',
@@ -989,7 +1026,7 @@ class MusicAssistantTouchCard extends HTMLElement {
       }
     }
     for (const soort of soorten) {
-      taken.push(this._bronHaal({ media_type: soort, limit: BIB_MAX }));
+      taken.push(this._bronHaal({ media_type: soort, limit: BIB_CAP() }));
     }
     if (!taken.length) return;
     Promise.all(taken).then(() => {
@@ -1034,6 +1071,8 @@ class MusicAssistantTouchCard extends HTMLElement {
   set hass(hass) {
     const eerste = !this._hass;
     this._hass = hass;
+    const hu = hass && hass.auth && hass.auth.data && hass.auth.data.hassUrl;
+    if (hu) OPTS.hass = hu;
     if (eerste || !this.shadowRoot.firstChild) this._bouw();
     this._pasThemaToe();
     this._syncSpeler();
@@ -1961,7 +2000,7 @@ class MusicAssistantTouchCard extends HTMLElement {
           lijst.push({
             titel: a.media_title,
             artiest: a.media_artist || '',
-            pic: a.entity_picture_local || a.entity_picture || '',
+            pic: VEILIG(a.entity_picture_local || a.entity_picture || ''),
           });
           if (lijst.length > 10) lijst.shift();
           this._reeksTijd = this._reeksTijd || {};
@@ -2000,7 +2039,7 @@ class MusicAssistantTouchCard extends HTMLElement {
     const nieuw = {
       titel: a.media_title || '',
       artiest: a.media_artist || '',
-      pic: a.entity_picture_local || a.entity_picture || '',
+      pic: VEILIG(a.entity_picture_local || a.entity_picture || ''),
     };
     const laatste = rij.length ? rij[rij.length - 1] : null;
     if (!laatste || laatste.titel !== nieuw.titel || laatste.artiest !== nieuw.artiest || laatste.pic !== nieuw.pic) {
@@ -2054,7 +2093,7 @@ class MusicAssistantTouchCard extends HTMLElement {
     const s = this._st(ent);
     const np = sr.getElementById('np');
     const a = this._metaLater(ent, (s && s.attributes) || {});
-    const pic = a.entity_picture_local || a.entity_picture || '';
+    const pic = VEILIG(a.entity_picture_local || a.entity_picture || '');
     const t = this._taal();
     const nietMA = ent === eigen && !!this._maSpeler(this._zoneCfg().entity).nietMA;
     const titel = nietMA ? t.noMaInfo : (a.media_title || (s ? t.nothingPlaying : t.playerNotFound));
