@@ -98,6 +98,16 @@ const SOORT_VAN = (uri) => ((uri || '').split('://')[1] || '').split('/')[0] || 
 // the card hangs on the wire, too long and a new playlist stays invisible.
 const BIB_TTL = 10 * 60 * 1000;
 const BIB_MAX = 500;
+// Where each card was when it was last on screen. Home Assistant throws a card
+// away when you navigate to another view and builds a new one when you come
+// back; without this the music page always reopened on the first speaker with
+// nothing playing. Kept per card (same Music Assistant + same speakers), in
+// memory for the session and the speaker/tab also in localStorage, so a cast
+// dashboard that is reloaded still opens where you left it.
+const GEHEUGEN = {};
+const GEH_LS = 'touch-music-card:';
+const lsLees = (k) => { try { return JSON.parse(localStorage.getItem(GEH_LS + k) || 'null'); } catch (e) { return null; } };
+const lsSchrijf = (k, v) => { try { localStorage.setItem(GEH_LS + k, JSON.stringify(v)); } catch (e) { /* private mode, cast */ } };
 // max_items in the config may raise the cap, e.g. to show every album artist.
 const BIB_CAP = () => Math.max(BIB_MAX, OPTS.max || 0);
 
@@ -621,6 +631,78 @@ class MusicAssistantTouchCard extends HTMLElement {
     this._schermtoetsen = config.keyboard !== false;
     this._kbd = this._schermtoetsen;
     this._zones = null;
+    this._herstel();
+  }
+
+  _geheugenSleutel() {
+    const z = (this._cfg.zones || []).map((x) => x.entity).join(',');
+    return `${this._cfg.config_entry_id}|${z}`;
+  }
+
+  // Put the card back where it was (see GEHEUGEN). Nothing remembered: leave
+  // _zoneGekozen false so the first hass update can pick the speaker that is
+  // actually playing.
+  _herstel() {
+    const k = this._geheugenSleutel();
+    const g = GEHEUGEN[k] || lsLees(k);
+    this._zoneGekozen = false;
+    if (!g) return;
+    const zones = this._cfg.zones || [];
+    const i = g.entity ? zones.findIndex((z) => z.entity === g.entity) : -1;
+    if (i >= 0) { this._zone = i; this._zoneGekozen = true; }
+    if (Number.isInteger(g.cat)) this._cat = g.cat;
+    this._sessieHerstel = !!GEHEUGEN[k];
+    if (GEHEUGEN[k]) {
+      for (const f of ['_mode', '_soort', '_q', '_res', '_det', '_detTitel', '_detUri', '_terug']) {
+        if (g[f] !== undefined) this[f] = g[f];
+      }
+    }
+  }
+
+  _onthoud() {
+    if (!this._cfg) return;
+    const k = this._geheugenSleutel();
+    const z = this._zoneLijst()[this._zone];
+    const g = {
+      entity: z && z.entity, cat: this._cat, _mode: this._mode, _soort: this._soort,
+      _q: this._q, _res: this._res, _det: this._det, _detTitel: this._detTitel,
+      _detUri: this._detUri, _terug: this._terug,
+    };
+    GEHEUGEN[k] = g;
+    lsSchrijf(k, { entity: g.entity, cat: g.cat });
+  }
+
+  // First time the card sees the house and nothing is remembered: open on the
+  // first speaker that is playing, instead of always on the first one.
+  _kiesSpelendeZone() {
+    if (this._zoneGekozen || !this._hass) return;
+    this._zoneGekozen = true;
+    const zones = this._zoneLijst();
+    const i = zones.findIndex((z) => {
+      const st = this._st(this._maSpeler(z.entity).ent);
+      return st && st.state === 'playing';
+    });
+    if (i > 0) this._zone = i;
+  }
+
+  // Nothing remembered from this session (first open, or the cast dashboard was
+  // reloaded) and the chosen speaker is playing: open the album or playlist
+  // that is playing, so you land on its track list instead of the home tiles.
+  async _openSpelendAlbum() {
+    if (this._sessieHerstel || this._mode !== 'home' || !this._hass) return;
+    const ent = this._speler();
+    const st = this._st(ent);
+    if (!st || !SPEELT.includes(st.state)) return;
+    try {
+      const r = await this._ws({
+        type: 'call_service', domain: 'music_assistant', service: 'get_queue',
+        service_data: { entity_id: ent }, return_response: true,
+      });
+      const q = ((r && r.response) || {})[ent] || {};
+      const mi = (q.current_item && q.current_item.media_item) || {};
+      const alb = mi.album;
+      if (alb && alb.uri && this._mode === 'home') this._open({ uri: alb.uri, name: alb.name }, null, 'home');
+    } catch (e) { /* no queue (radio, other app): stay on the tiles */ }
   }
 
   // zones uit de config, of anders alle Music Assistant spelers automatisch
@@ -769,6 +851,10 @@ class MusicAssistantTouchCard extends HTMLElement {
     this._hass = hass;
     const hu = hass && hass.auth && hass.auth.data && hass.auth.data.hassUrl;
     if (hu) OPTS.hass = hu;
+    if (eerste) {
+      this._kiesSpelendeZone();
+      setTimeout(() => this._openSpelendAlbum(), 0);
+    }
     if (eerste || !this.shadowRoot.firstChild) this._bouw();
     this._pasThemaToe();
     this._syncSpeler();
@@ -1055,7 +1141,9 @@ class MusicAssistantTouchCard extends HTMLElement {
       ? { media: st.attributes.media_content_id || '', queue: st.attributes.active_queue || null }
       : null;
     this._zone = i;
+    this._zoneGekozen = true;
     this._opt = null;
+    this._onthoud();
     this._syncSpeler();
     const nieuw = { entity: this._speler() };
     if (el) el.classList.add('bezig');
@@ -1373,7 +1461,7 @@ class MusicAssistantTouchCard extends HTMLElement {
     }
     else if (a === 'naarzoek') { this._mode = 'zoek'; this._kbd = this._schermtoetsen; this._tekenRechts(); }
     else if (a === 'home') { this._mode = 'home'; this._tekenRechts(); }
-    else if (a === 'cat') { this._cat = i; this._mode = 'home'; this._tekenRechts(); }
+    else if (a === 'cat') { this._cat = i; this._mode = 'home'; this._onthoud(); this._tekenRechts(); }
     else if (a === 'soort') { this._soort = i; if (this._q.trim()) this._zoek(); else this._tekenRechts(); }
     else if (a === 'kbd') { this._kbd = !this._kbd; this._tekenRechts(); }
     else if (a === 'toets') this._toets(t.dataset.t);
@@ -1863,6 +1951,7 @@ class MusicAssistantTouchCard extends HTMLElement {
   }
 
   disconnectedCallback() {
+    this._onthoud();
     this._sleepLos();
     clearInterval(this._tikTimer);
     clearInterval(this._scrollTimer);
