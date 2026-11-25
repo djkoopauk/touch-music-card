@@ -41,6 +41,15 @@ const esc = (s) => String(s == null ? '' : s)
   .replace(/"/g, '&quot;');
 
 const SPEELT = ['playing', 'paused', 'buffering'];
+// A Nest Hub (or other cast display) that is showing a Home Assistant
+// dashboard reports itself as "paused" even though nothing is loaded. Only
+// count a speaker as having music when something real is playing or paused.
+const heeftMuziek = (st) => {
+  if (!st || !SPEELT.includes(st.state)) return false;
+  const a = st.attributes || {};
+  if (a.source === 'Home Assistant Lovelace' || a.app_name === 'Home Assistant Lovelace') return false;
+  return st.state !== 'paused' || !!a.media_title;
+};
 
 // Music Assistant serves the covers it proxies itself over plain http, on its
 // own address. On a dashboard opened over https - Nabu Casa, a reverse proxy -
@@ -2165,7 +2174,7 @@ class MusicAssistantTouchCard extends HTMLElement {
       b.classList.toggle('on', i === this._zone);
       const z = zones[i];
       const zst = z && this._st(this._maSpeler(z.entity).ent);
-      b.classList.toggle('speelt', !!(zst && SPEELT.includes(zst.state)));
+      b.classList.toggle('speelt', heeftMuziek(zst));
     });
 
     const vol = this._volNu() || 0;
